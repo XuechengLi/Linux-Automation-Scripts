@@ -1,0 +1,211 @@
+pipeline {
+    agent any
+
+    tools {
+        jdk 'jdk21'
+        maven 'maven3.9.9'
+    }
+
+    environment {
+        PROJECT_ROOT = "${WORKSPACE}"
+        MVN_REPOSITORY = "/opt/maven/maven3.9.9/repository"
+        MVN = "/opt/maven/maven3.9.9/bin/mvn"
+        MAVEN_SETTINGS = "/opt/maven/maven3.9.9/conf/settings.xml"
+
+        // 生产1 ip
+        REMOTE_HOST_1 = "60.205.225.68"
+        // 生产2 ip
+        REMOTE_HOST_2 = "39.105.29.91"
+        // 生产3 ip
+        REMOTE_HOST_3 = "47.95.218.128"
+        //生产1 凭证 ID
+        REMOTE_PRIVATE_KEY_1 = 'release1'
+        //生产2 凭证 ID
+        REMOTE_PRIVATE_KEY_2 = 'release2'
+        //生产3 凭证 ID
+        REMOTE_PRIVATE_KEY_3 = 'release3'
+
+        DKDY_CLOUD_DIR = "/opt/deploy-application/backend/dkdy-cloud"
+
+    }
+
+    options {
+        skipStagesAfterUnstable()
+    }
+
+    stages {
+        stage('删除本地仓库缓存') {
+            steps {
+                script {
+
+                    // 处理参数：获取选中的模块列表
+                    def modulesToBuild = params.DKDYCLOUD
+                    echo "本次选择的模块：${modulesToBuild}"
+
+                    // 构建删除命令
+                    def rmCommand = "rm -rf ${MVN_REPOSITORY}/com/dkdy"
+                    sh rmCommand
+                }
+            }
+        }
+
+        stage('构建所有模块') {
+            steps {
+                script {
+                    // 构建命令基础部分
+                    def mvnInstallCommand = "${MVN} -f ${PROJECT_ROOT}/pom.xml -s ${MAVEN_SETTINGS} clean -DskipTests=true -Dfile.encoding=UTF-8 -Dsun.stdout.encoding=UTF-8 -Dsun.stderr.encoding=UTF-8 -T 2C install"
+                    sh mvnInstallCommand
+                }
+            }
+        }
+
+        stage('传输jar到指定位置并启动') {
+            steps {
+                script {
+                    def modulesToStr = params.DKDYCLOUD
+                    echo "需要部署的模块：${modulesToStr}"
+
+                    // env 不能配置 list 和 map
+                    def list1 = ['service-ai-bailian','service-auth', 'service-cs', 'service-oss', 'service-sms', 'service-props', 'service-loc', 'service-tool', 'service-dingtalk','service-exam','service-ai-google']
+                    def list2 = ['service-auth', 'service-tms', 'service-cls', 'service-external', 'service-channel', 'gateway']
+                    def list3 = ['service-auth','service-cms','service-customer','service-task']
+                    def toDirPrefix = env.DKDY_CLOUD_DIR
+
+                    def serverPort = [
+                            "gateway"         : "20000",
+                            "service-auth"    : "20100",
+                            "service-cms"     : "20200",
+                            "service-tms"     : "20300",
+                            "service-cs"      : "20400",
+                            "service-oss"     : "20500",
+                            "service-sms"     : "20600",
+                            "service-props"   : "20700",
+                            "service-cls"     : "20800",
+                            "service-loc"     : "20900",
+                            "service-tool"    : "21000",
+                            "service-dingtalk": "21100",
+                            "service-external": "21200",
+                            "service-channel" : "21300",
+                            "service-exam"    : "21400",
+                            "service-ai-bailian" : "21600",
+                            "service-customer"   : "21700",
+                            "service-ai-google"  : "21800",
+                            "service-task"    : "21900"
+                    ]
+
+                    def modulesToCollect = modulesToStr.split(',').collect { it.trim() }
+
+                    for (int i = 0; i < modulesToCollect.size(); i++) { // 直接遍历列表，而非持有迭代器
+                        def module = modulesToCollect[i]
+                        echo "构建模块：${module}"
+                        if (!serverPort.containsKey(module)) {
+                            error "模块 ${module} 未在 serverPort 中配置端口，无法生成重启脚本名"
+                        }
+                        def restartName = "restart_" + serverPort[module] + ".sh"
+                        // 判断模块属于哪个服务器 根据 LIST_1  LIST_2
+                        if (list2.contains(module)) {
+                            echo "当前模块${module}: 命中生产2"
+                            // 用于区分 gateway 服务
+                            def fromPath
+                            // *.jar 暂时识别不到
+                            if (module.contains('service')) {
+                                fromPath = "services/${module}/target/${module}-1.jar"
+                            } else {
+                                fromPath = "${module}/target/${module}-1.jar"
+                            }
+                            // 动态生成产物源路径和目标路径
+                            withCredentials([usernamePassword(
+                                    credentialsId: env.REMOTE_PRIVATE_KEY_2,
+                                    usernameVariable: 'REMOTE_USER',
+                                    passwordVariable: 'REMOTE_PASSWORD'
+                            )]) {
+                                // 当前先测试为 主机2
+                                def remote = [:]
+                                remote.host = env.REMOTE_HOST_2
+                                remote.user = REMOTE_USER
+                                remote.password = REMOTE_PASSWORD
+                                remote.name = 'jenkins-release2'
+                                remote.allowAnyHosts = true
+
+                                // 1. 上传文件
+                                sshPut remote: remote,
+                                        from: fromPath,
+                                        into: "${toDirPrefix}/${module}/${module}-1.jar"
+
+                                // 2. 执行部署命令
+                                sshCommand remote: remote, command: """
+                                    # 备份现有应用
+                                    # sudo cp -f ${toDirPrefix}/${module}/${module}-1.jar ${toDirPrefix}/${module}/backup/${module}-1.jar.\$(date +%Y%m%d%H%M%S)
+                                    # 重启服务
+                                    echo "重启服务"
+                                    sh ${toDirPrefix}/${module}/${restartName}
+                                """
+                                echo "✅ 部署完成"
+                            }
+                        }
+
+                        if (list1.contains(module)) {
+                            echo "当前模块${module}: 命中生产1"
+                            // 动态生成产物源路径和目标路径
+                            withCredentials([usernamePassword(
+                                    credentialsId: env.REMOTE_PRIVATE_KEY_1,
+                                    usernameVariable: 'REMOTE_USER',
+                                    passwordVariable: 'REMOTE_PASSWORD'
+                            )]) {
+                                // 当前先测试为 主机2
+                                def remote = [:]
+                                remote.host = env.REMOTE_HOST_1
+                                remote.user = REMOTE_USER
+                                remote.password = REMOTE_PASSWORD
+                                remote.name = 'jenkins-release1'
+                                remote.allowAnyHosts = true
+
+                                // 1. 上传文件
+                                sshPut remote: remote,
+                                        from: "services/${module}/target/${module}-1.jar",
+                                        into: "${toDirPrefix}/${module}/${module}-1.jar"
+
+                                // 2. 执行部署命令
+                                sshCommand remote: remote, command: """
+                                    # 重启服务
+                                    echo "重启服务"
+                                    cd ${toDirPrefix}/${module}
+                                    sh ${toDirPrefix}/${module}/${restartName}
+                                """
+                                echo "✅ 上传完成"
+                            }
+                        }
+                        if (list3.contains(module)) {
+                            // ===== release3 逻辑 =====
+                            withCredentials([usernamePassword(
+                                    credentialsId: env.REMOTE_PRIVATE_KEY_3,
+                                    usernameVariable: 'REMOTE_USER',
+                                    passwordVariable: 'REMOTE_PASSWORD'
+                            )]) {
+                                def remote = [:]
+                                remote.host = env.REMOTE_HOST_3
+                                remote.user = REMOTE_USER
+                                remote.password = REMOTE_PASSWORD
+                                remote.name = 'jenkins-release3'
+                                remote.allowAnyHosts = true
+
+                                sshPut remote: remote,
+                                        from: "services/${module}/target/${module}-1.jar",
+                                        into: "${toDirPrefix}/${module}/${module}-1.jar"
+
+                                sshCommand remote: remote, command: """
+                                    echo "重启服务"
+                                    cd ${toDirPrefix}/${module}
+                                    sh ${toDirPrefix}/${module}/${restartName}
+                                """
+
+                                echo "✅ 部署完成（生产3）"
+                              }
+                          }
+                    }
+                }
+            }
+        }
+
+    }
+}
